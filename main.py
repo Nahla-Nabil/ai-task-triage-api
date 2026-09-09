@@ -8,6 +8,7 @@ import db
 import triage
 from auth import AuthedUser, AuthError
 from llm.schema import TriageRequest
+from triage import TriageError
 
 app = FastAPI(
     title="Task API",
@@ -20,6 +21,10 @@ auth.ping()
 
 @app.exception_handler(AuthError)
 def handle_auth_error(request: Request, exc: AuthError):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+@app.exception_handler(TriageError)
+def handle_triage_error(request: Request, exc: TriageError):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
 
 
