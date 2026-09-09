@@ -33,6 +33,55 @@ docker exec -it <db-container-name> psql -U postgres -d tasks -c "SELECT * FROM 
 - **Secrets:** `SUPABASE_URL` and `SUPABASE_KEY` (the **anon key** — never the `service_role` key, which bypasses all security) are read from `.env` the same way `DATABASE_URL` and `REDIS_URL` already were.
 - **Scope, on purpose:** the existing `/tasks` routes are intentionally left untouched and unprotected this round. This assignment is scoped to exactly five new routes (`/auth/*`, `/protected/*`, `/public/info`) to practice the auth pattern on its own — wiring task ownership onto `/tasks` is explicitly next week's tenant-isolation work.
 
+## AI triage (`POST /tasks/triage`)
+
+**What it does:** takes a raw, messy task description — the kind you type in ten seconds without thinking about it — and returns a category, a priority, and a cleaned-up title, so it lands in the right place on the list without you doing the sorting by hand. See [JOB-CARD.md](JOB-CARD.md) for the full spec, including the "must never" list and the when-unsure rule.
+
+- **One narrow job, not a chatbot.** One request in `{"text": "..."}`, one structured answer out. `category` and `priority` are drawn from fixed lists (`work|personal|shopping|health|other`, `low|normal|high`) — never free text, never invented.
+- **The contract exists before the model does.** [`llm/schema.py`](llm/schema.py) defines `TriageRequest` (input) and `TriageResult` (output) as Pydantic models. Every request is validated against `TriageRequest` in [`main.py`](main.py) *before* any model call — a missing, empty, too-long, or wrong-typed `text` field returns `400` naming the field, and costs nothing.
+- **The prompt is a versioned file**, not a string in a route handler: [`prompts/triage-v1.md`](prompts/triage-v1.md). It has a role, the exact output shape, the closed lists, the "never" rules, the when-unsure instruction, and three worked examples (a typical case, an ambiguous one, and a prompt-injection attempt). The task text always travels as its own JSON-encoded user message — never concatenated into the system prompt — which is the cheap, standard defence against prompt injection described in [OWASP LLM01](https://owasp.org/www-project-top-10-for-large-language-model-applications/).
+- **Parse → validate → repair once → quarantine.** [`triage.py`](triage.py) strips any code fence the model wraps its answer in, parses the JSON, and validates it against `TriageResult`. If that fails (bad JSON, or a value outside a closed list), it makes exactly one repair call — the model's own broken answer plus the exact validation error, asking for a corrected object — and if that *also* fails, the request gets a `422` and the raw output is appended to `logs/quarantine.jsonl` (git-ignored — it can contain real user task text) instead of the process crashing or a bad object reaching a caller. Raw model text is never returned to the caller, success or failure.
+- **A real timeout, and a retry policy that knows when to stop.** [`llm/client.py`](llm/client.py) sets an explicit 30-second timeout (`LLM_TIMEOUT_SECONDS`) and disables the OpenAI SDK's own defaults — a 10-minute timeout and 2 automatic retries — in favour of its own explicit policy: retry on a timeout, `429`, or `5xx` (exponential backoff with jitter, capped at `LLM_MAX_RETRIES=2` extra attempts; a `Retry-After` header is obeyed instead of guessed), and **never** retry a `400`, `401`, or `403` — a bad key stays a bad key. A timeout that survives the retries returns `504`; a provider-side auth/permission/status error returns `503`. None of it takes the process down.
+- **Every call is logged.** One structured JSON line to stdout per model call: prompt version, model, input/output token counts, duration, and whether it was a repair — the same line the cost estimate below is built from.
+- **A kill switch.** `LLM_ENABLED=false` skips the model entirely and returns a safe, deterministic fallback (`category: "other"`, `confidence: 0.0`) instead — no deploy required to turn the feature off during a provider outage or a bill spike.
+- **A stub mode**, separate from the kill switch: `LLM_STUB=1` also skips the model, returning a fixed schema-valid object — used for every restart-the-server iteration while building, so debugging never spends a real call. The repo's own `.env` ships with `LLM_STUB=1` by default so cloning and running it costs nothing until you deliberately turn it off.
+
+**Provider:** [OpenRouter](https://openrouter.ai) (hosted, free, no credit card), model `openrouter/free`. Swapping to a different OpenRouter model, or to a local [Ollama](https://ollama.com) server, is changing exactly three env vars and nothing else — `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` — because every line that knows about the provider lives in `llm/client.py`. That's also why the client library is the package literally named `openai` even though the default provider here isn't OpenAI: it's the request shape almost every provider has since copied.
+
+**Setup, once, before it costs anything:** at [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy), turn **on** both *"Free endpoints that may train on request data"* and *"Free endpoints that may publish prompts"* — free models 404 until both are on. Because of that setting, never send real personal data through this endpoint; the eval cases below are all made up.
+
+```bash
+curl.exe -i -X POST http://localhost:8000/tasks/triage -H "Content-Type: application/json" -d "{`"text`":`"pay the electric bill by friday`"}"
+```
+
+Response:
+```json
+{
+  "category": "personal",
+  "priority": "high",
+  "clean_title": "Pay electric bill",
+  "confidence": 0.9
+}
+```
+
+A deliberately broken request — text over the 2000-character limit, or missing entirely:
+```bash
+curl.exe -i -X POST http://localhost:8000/tasks/triage -H "Content-Type: application/json" -d "{}"
+```
+
+Response:
+```json
+{ "error": "text: Field required" }
+```
+
+**Eval:** `evals/cases.json` has 8 hand-labelled cases (5 typical, 1 ambiguous, 1 near-empty, 1 a prompt-injection attempt), run by `python evals/run_eval.py` against a live server.
+
+> **8/8 correct on category** — `prompts/triage-v1.md`, run 2026-09-09 against `openrouter/free` on a real OpenRouter key, `LLM_STUB=0`. Zero repairs needed on any of the 8 calls (`repaired: false` on every logged line) and `logs/quarantine.jsonl` stayed empty — the prompt held on the first try every time, including the prompt-injection case (classified as `other`, never followed the embedded instruction). The two when-unsure cases (`vague`, `empty_ish`) both landed on `category: "other"` with confidence `0.3`, exactly as `prompts/triage-v1.md`'s when-unsure rule asks for.
+
+**Cost:** one `/tasks/triage` call on `openrouter/free` logs its exact token counts to stdout (see `_log_cost` in `triage.py`). Real numbers from the eval run above (9 calls, including one manual check): **568 input / 640 output tokens/call on average** — output is unusually high because this particular free router happens to land on a reasoning-style model that thinks out loud before the JSON (`parse_json_object`'s brace-slicing is what makes that safe to ignore). Free-tier requests are $0 regardless of token count. For a paid model at 10,000 requests/day, that's roughly 5.7M input + 6.4M output tokens/day — e.g. ~$0.80/day on a cheap small model (~$0.05/M in, $0.08/M out) up to ~$4.70/day on something like GPT-4o-mini ($0.15/M in, $0.60/M out); the [LLM price calculator](https://llmpricecheck.com/calculator/) does the exact arithmetic for a specific model. **Output tokens are the biggest cost driver here** — the opposite of the "input always dominates" rule of thumb — specifically because of that reasoning overhead.
+
+**What I'd fix with another day:** pin `openrouter/free` to a non-reasoning small model instead of the router default — the 640-token average output above is almost entirely invisible "thinking" the caller never sees, and it's most of the per-call latency (several calls took 10-30+ seconds) and cost. After that: cache identical `{text, prompt_version}` requests — task text repeats more than free-form support messages do (the same three or four chores get re-typed) — and add `response_format` / structured-output support where the provider allows it, so a malformed answer becomes impossible instead of merely unlikely and repaired.
+
 ## How to run
 
 **The one-command way (recommended):**
@@ -42,10 +91,11 @@ docker exec -it <db-container-name> psql -U postgres -d tasks -c "SELECT * FROM 
    git clone https://github.com/Nahla-Nabil/todo-api.git
    cd todo-api
 ```
-2. Copy the example env file, then fill in `SUPABASE_URL` and `SUPABASE_KEY` from your own Supabase project (`Project Settings → API` — use the **anon** key, never `service_role`). `compose.yaml` sets its own `DATABASE_URL`/`REDIS_URL` for the containerized run, but Supabase is a cloud service, not a container in this stack, so those two variables always come from `.env`:
+2. Copy the example env file, then fill in `SUPABASE_URL` and `SUPABASE_KEY` from your own Supabase project (`Project Settings → API` — use the **anon** key, never `service_role`). `compose.yaml` sets its own `DATABASE_URL`/`REDIS_URL` for the containerized run, but Supabase and the LLM provider are both cloud services, not containers in this stack, so those variables always come from `.env`:
 ```bash
    cp .env.example .env
 ```
+   `LLM_STUB=1` is the default in `.env.example`, so the app runs with zero AI setup out of the box. To see `POST /tasks/triage` call a real model: sign up at [openrouter.ai](https://openrouter.ai), turn on both privacy toggles at [openrouter.ai/settings/privacy](https://openrouter.ai/settings/privacy) (free models 404 until you do), create a key, and set `LLM_API_KEY` in `.env` — then set `LLM_STUB=0`.
 3. Start everything — the API, Postgres, and Redis:
 ```bash
    docker compose up --build
@@ -81,6 +131,7 @@ docker exec -it <db-container-name> psql -U postgres -d tasks -c "SELECT * FROM 
 | POST   | /tasks                | Create a new task                          | No                           |
 | PUT    | /tasks/{id}           | Update a task                             | No                           |
 | DELETE | /tasks/{id}           | Delete a task                             | No                           |
+| POST   | /tasks/triage         | AI: category, priority & clean title      | No                           |
 | POST   | /auth/signup          | Create a new user account                 | No                           |
 | POST   | /auth/login           | Authenticate & return a JWT               | No                           |
 | POST   | /auth/logout          | End the user's session                    | Yes — `Authorization: Bearer <token>` |
