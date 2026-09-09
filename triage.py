@@ -1,19 +1,26 @@
-"""POST /tasks/triage's business logic. Same shape as auth.py, db.py and
-cache.py: main.py's route only ever calls triage.run_triage() — nothing
-outside this file knows how a triage judgement actually gets made.
+"""POST /tasks/triage's business logic: build the prompt, call the model,
+parse + validate + repair its answer, and log what it cost. Same shape as
+auth.py, db.py and cache.py — main.py's route only ever calls
+triage.run_triage(); nothing outside this file knows how a triage judgement
+actually gets made.
 
-Stage 3: the model's answer is now treated as untrusted input, exactly
-like Week 6's external data — parsed, validated against the schema, given
-one repair attempt if it fails, and quarantined (never crashed, never
-handed to the caller as-is) if it fails twice. Stage 4 adds a real timeout,
-a retry policy, cost logging and a kill switch around the call itself.
+The six-line version of what happens below:
+
+    validate the input       -> done by the route, before this module runs
+    build the prompt         -> load_prompt() + build_messages()
+    call the model            -> llm.client.complete_with_retry()
+    parse + validate output  -> parse_json_object() + TriageResult
+    repair once if it failed -> _attempt() called a second time, with the error
+    return clean JSON        -> TriageResult.model_dump(), or a TriageError
 """
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import openai
 import pydantic
 
 from llm import client as llm_client
@@ -26,7 +33,9 @@ QUARANTINE_PATH = Path(__file__).parent / "logs" / "quarantine.jsonl"
 
 class TriageError(Exception):
     """Carries a status code and message through to main.py's exception
-    handler, same pattern as auth.AuthError."""
+    handler, same pattern as auth.AuthError. Used for both "the model
+    could not produce a valid answer" (422) and "the provider itself
+    failed" (504/503)."""
 
     def __init__(self, status_code: int, message: str):
         self.status_code = status_code
@@ -70,13 +79,6 @@ def parse_json_object(raw: str) -> dict:
         raise ValueError(f"model output was not valid JSON: {exc}") from exc
 
 
-def _parse_and_validate(raw_text: str) -> dict:
-    """Raises ValueError or pydantic.ValidationError on anything short of a
-    schema-valid object — the one place run_triage() decides "did this
-    attempt succeed"."""
-    return TriageResult.model_validate(parse_json_object(raw_text)).model_dump()
-
-
 def _stub_result(text: str) -> TriageResult:
     """LLM_STUB=1 — a fixed, schema-valid object, no model call. Used for
     every restart-the-server iteration; see README for why this exists."""
@@ -86,6 +88,35 @@ def _stub_result(text: str) -> TriageResult:
         clean_title=text.strip()[:80] or "Untitled task",
         confidence=0.42,
     )
+
+
+def _fallback_result(text: str) -> TriageResult:
+    """LLM_ENABLED=false — the kill switch. Deterministic, no model call,
+    schema-valid: a caller downstream still gets a usable object instead of
+    a broken feature during a provider outage or a bill spike."""
+    return TriageResult(
+        category="other",
+        priority="normal",
+        clean_title=text.strip()[:80] or "Untitled task",
+        confidence=0.0,
+    )
+
+
+def _log_cost(model: str, input_tokens: int, output_tokens: int, duration_ms: float, repaired: bool, stubbed: bool) -> None:
+    """One structured JSON line per call, to stdout — Twelve-Factor style,
+    no invented log file. Stage 4's "how much will this cost at 10k/day"
+    question is answered by multiplying this line's tokens by the price
+    calculator, not by guessing."""
+    print(json.dumps({
+        "event": "llm_call",
+        "prompt_version": PROMPT_VERSION,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "duration_ms": round(duration_ms, 1),
+        "repaired": repaired,
+        "stubbed": stubbed,
+    }))
 
 
 def _quarantine(text: str, raw_output: str, error: str) -> None:
@@ -103,16 +134,47 @@ def _quarantine(text: str, raw_output: str, error: str) -> None:
         }) + "\n")
 
 
+def _call_model(messages: list[dict], repaired: bool) -> str:
+    """Wraps llm.client.complete_with_retry(): turns provider failures that
+    survive the retry policy into the status codes the README promises
+    (504 for "too slow", 503 for "the provider itself is broken"), and logs
+    what the call cost either way. Used for both the first attempt and the
+    one repair attempt — `repaired` just says which, for the cost log."""
+    start = time.monotonic()
+    try:
+        result = llm_client.complete_with_retry(messages)
+    except (openai.APITimeoutError, openai.APIConnectionError) as exc:
+        raise TriageError(504, "The model took too long to respond") from exc
+    except openai.AuthenticationError as exc:
+        raise TriageError(503, "The model provider rejected our credentials") from exc
+    except openai.APIStatusError as exc:
+        raise TriageError(503, f"The model provider returned an error ({exc.status_code})") from exc
+    duration_ms = (time.monotonic() - start) * 1000
+    _log_cost(llm_client.LLM_MODEL, result.input_tokens, result.output_tokens, duration_ms, repaired, stubbed=False)
+    return result.text
+
+
+def _parse_and_validate(raw_text: str) -> dict:
+    """Raises ValueError or pydantic.ValidationError on anything short of a
+    schema-valid object — the one place run_triage() decides "did this
+    attempt succeed"."""
+    return TriageResult.model_validate(parse_json_object(raw_text)).model_dump()
+
+
 def run_triage(text: str) -> dict:
-    """The pipeline for one request. Input validation already happened in
-    the route (main.py) before this function is ever called."""
+    """The whole pipeline for one request. Input validation already
+    happened in the route (main.py) before this function is ever called —
+    every call in here is one that has already earned its cost."""
     if os.environ.get("LLM_STUB") == "1":
         return _stub_result(text).model_dump()
+
+    if os.environ.get("LLM_ENABLED", "true").lower() == "false":
+        return _fallback_result(text).model_dump()
 
     system_prompt = load_prompt()
     messages = build_messages(text, system_prompt)
 
-    raw_text = llm_client.complete(messages)
+    raw_text = _call_model(messages, repaired=False)
     try:
         return _parse_and_validate(raw_text)
     except (ValueError, pydantic.ValidationError) as first_error:
@@ -125,7 +187,7 @@ def run_triage(text: str) -> dict:
                 f"{first_error}. Return only corrected JSON matching the schema."
             )},
         ]
-        repaired_text = llm_client.complete(repair_messages)
+        repaired_text = _call_model(repair_messages, repaired=True)
         try:
             return _parse_and_validate(repaired_text)
         except (ValueError, pydantic.ValidationError) as second_error:
