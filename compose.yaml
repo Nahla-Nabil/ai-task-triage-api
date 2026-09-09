@@ -8,6 +8,13 @@ services:
       REDIS_URL: redis://redis:6379/0
       SUPABASE_URL: ${SUPABASE_URL}
       SUPABASE_KEY: ${SUPABASE_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES}
+      LLM_STUB: ${LLM_STUB}
+      LLM_ENABLED: ${LLM_ENABLED}
     depends_on:
       - db
       - redis
