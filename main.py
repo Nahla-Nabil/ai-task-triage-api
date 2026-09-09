@@ -1,11 +1,13 @@
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import auth
 import cache
 import db
+import triage
 from auth import AuthedUser, AuthError
+from llm.schema import TriageRequest
 
 app = FastAPI(
     title="Task API",
@@ -41,7 +43,7 @@ class LoginRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"name": "Task API", "version": "1.0", "endpoints": ["/tasks"]}
+    return {"name": "Task API", "version": "1.0", "endpoints": ["/tasks", "/tasks/triage"]}
 
 @app.get("/health")
 def health():
@@ -108,6 +110,23 @@ def delete_task(task_id: int):
     if row is None:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
     db.delete_task(task_id)
+
+@app.post("/tasks/triage")
+def triage_task(payload: dict = Body(...)):
+    """Takes a raw, messy task description and returns a category, a
+    priority, and a cleaned-up title — see JOB-CARD.md. The body is taken
+    as a plain dict (not a Pydantic route parameter) specifically so a bad
+    request lands here, in our own {"error": "field: message"} shape and a
+    400, before a single model call is made — instead of FastAPI's default
+    422, which is what a Pydantic-typed parameter would produce."""
+    try:
+        request = TriageRequest.model_validate(payload)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        field = ".".join(str(part) for part in first["loc"]) or "text"
+        return JSONResponse(status_code=400, content={"error": f"{field}: {first['msg']}"})
+
+    return triage.run_triage(request.text)
 
 @app.post("/auth/signup", status_code=201)
 def signup(body: SignupRequest):
