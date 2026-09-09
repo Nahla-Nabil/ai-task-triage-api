@@ -5,3 +5,4 @@ tasks.db-journal
 *.sqbpro
 .env
 .claude/
+logs/*.jsonl
