@@ -1,6 +1,73 @@
-# Task API
+# AI Task Triage API
 
-A small CRUD API for managing a to-do list, built with FastAPI. Data is stored in a containerized **PostgreSQL** database, started together with the app by a single `docker compose up`.
+A FastAPI to-do API (PostgreSQL and Redis in Docker Compose, Supabase Auth) with one AI feature built the careful way. `POST /tasks/triage` turns messy text like `pay the electric bill by friday` into a **category, a priority and a clean title**, treating the model as an untrusted component: the input is validated first, the prompt is a versioned file, the output is checked against a schema, a bad answer gets exactly one repair attempt and is then quarantined, and every call has a timeout, a retry policy, a cost log and a kill switch.
+
+On an 8-case hand-labelled eval (including a prompt-injection attempt) it classifies **8/8 correctly** on category. Details are in [AI triage](#ai-triage-post-taskstriage).
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    client(["Client<br/>curl or Swagger UI"]) -->|"HTTP :8000"| api
+
+    subgraph compose["docker compose up"]
+        api["FastAPI app<br/>main.py"]
+        db[("PostgreSQL 16<br/>tasks table")]
+        redis[("Redis 7")]
+        api -->|"parameterised SQL"| db
+        api -->|"health check PING"| redis
+    end
+
+    api -->|"verify token"| supabase["Supabase Auth"]
+    api -->|"POST /tasks/triage"| llm["LLM provider<br/>OpenAI-compatible API"]
+```
+
+Postgres and Redis run in containers; Supabase and the model provider are cloud services, so their credentials come from `.env`.
+
+## What happens to one triage request
+
+```mermaid
+flowchart TD
+    req(["POST /tasks/triage"]) --> valid{"Valid request?<br/>text present, up to 2000 chars"}
+    valid -- no --> e400[/"400 naming the field<br/>no model call, no cost"/]
+    valid -- yes --> stub{"LLM_STUB=1?"}
+    stub -- yes --> stubout[/"200 fixed object<br/>no model call"/]
+    stub -- no --> kill{"LLM_ENABLED=false?"}
+    kill -- yes --> fallback[/"200 safe fallback<br/>category other, confidence 0.0"/]
+    kill -- no --> call1["Call the model<br/>30 s timeout, retry on timeout, 429 and 5xx"]
+    call1 -- "provider failed" --> e5xx[/"504 too slow<br/>503 provider error"/]
+    call1 -- "got a reply" --> check1{"Valid JSON matching<br/>the TriageResult schema?"}
+    check1 -- yes --> ok[/"200 category, priority,<br/>clean_title, confidence"/]
+    check1 -- no --> repair["One repair call:<br/>the bad answer plus the exact error"]
+    repair --> check2{"Valid now?"}
+    check2 -- yes --> ok
+    check2 -- no --> quarantine["Save the raw output to<br/>logs/quarantine.jsonl"]
+    quarantine --> e422[/"422 no bad object reaches the caller"/]
+
+    classDef good fill:#d1fae5,stroke:#059669,color:#064e3b
+    classDef bad fill:#fee2e2,stroke:#e11d48,color:#7f1d1d
+    class ok,stubout,fallback good
+    class e400,e5xx,e422 bad
+```
+
+Every model call writes one JSON log line (prompt version, model, tokens, duration, whether it was a repair), which is what the cost estimate below is built from.
+
+## Project map
+
+| Path | What it is |
+| --- | --- |
+| `main.py` | FastAPI routes and error handlers |
+| `db.py` | The only file with SQL (all queries parameterised) |
+| `cache.py` | Redis connection and health ping |
+| `auth.py` | Supabase Auth calls and the `require_user` guard |
+| `triage.py` | The triage pipeline shown above |
+| `llm/` | `client.py` (the only module that talks to a model provider), `schema.py` (the Pydantic input and output contract), `hello.py` (a standalone connectivity check) |
+| `prompts/triage-v1.md` | The versioned prompt |
+| `evals/` | `cases.json` (8 labelled cases) and `run_eval.py` |
+| `JOB-CARD.md` | The spec for the triage feature, including its "must never" list |
+| `ai-version/` | AI-generated versions kept for the "AI vs me" comparisons at the bottom; the app doesn't use them |
+| `screenshots/` | Images used in this README |
+| `compose.yaml`, `Dockerfile` | The one-command run |
 
 ## Database
 
@@ -21,7 +88,6 @@ docker exec -it <db-container-name> psql -U postgres -d tasks -c "SELECT * FROM 
 ```
 
 ![psql — tasks table](screenshots/postgres-tasks.png)
-<!-- TODO: replace the line above with an actual screenshot of the psql output above, saved as screenshots/postgres-tasks.png (or a GUI like pgAdmin/DBeaver/TablePlus showing the tasks table) -->
 
 ## Auth
 
@@ -88,8 +154,8 @@ Response:
 
 1. Clone this repo and enter the folder:
 ```bash
-   git clone https://github.com/Nahla-Nabil/todo-api.git
-   cd todo-api
+   git clone https://github.com/Nahla-Nabil/ai-task-triage-api.git
+   cd ai-task-triage-api
 ```
 2. Copy the example env file, then fill in `SUPABASE_URL` and `SUPABASE_KEY` from your own Supabase project (`Project Settings → API` — use the **anon** key, never `service_role`). `compose.yaml` sets its own `DATABASE_URL`/`REDIS_URL` for the containerized run, but Supabase and the LLM provider are both cloud services, not containers in this stack, so those variables always come from `.env`:
 ```bash
@@ -187,7 +253,7 @@ A few optional stretch goals from the assignment, done after the core 6 stages:
 
 Creating the index alone didn't change anything — Postgres's query planner was still working off stale statistics from before the index existed, so it kept picking a sequential scan. Only after `ANALYZE` refreshed those statistics did the planner realize the index was worth using, roughly halving execution time. The index (`idx_tasks_done`) is now created automatically in `db.init_db()`; the 200k test rows were deleted afterward — the seeded table still only has the original 3 tasks.
 
-**A multi-stage Dockerfile.** Split the build into a `builder` stage that installs dependencies into `/install`, and a final stage that only copies that installed prefix plus the two source files — no pip cache, build metadata, or intermediate layers carried into the final image. Went from **240MB → 227MB**. The reduction is modest here since the original Dockerfile already used `--no-cache-dir` and never needed extra build tools (`psycopg[binary]` ships prebuilt wheels) — the main win of multi-stage builds shows up more when a project actually needs a compiler toolchain to build dependencies.
+**A multi-stage Dockerfile.** Split the build into a `builder` stage that installs dependencies into `/install`, and a final stage that only copies that installed prefix plus the app source (`main.py`, `db.py`, `cache.py`, `auth.py`, `triage.py` and the `llm/` and `prompts/` folders) — no pip cache, build metadata, or intermediate layers carried into the final image. Went from **240MB → 227MB** (measured back when only `main.py` and `db.py` were copied; the image now also ships the AI code, so today's exact size differs). The reduction is modest here since the original Dockerfile already used `--no-cache-dir` and never needed extra build tools (`psycopg[binary]` ships prebuilt wheels) — the main win of multi-stage builds shows up more when a project actually needs a compiler toolchain to build dependencies.
 
 ## AI vs me — Assignment 1 (in-memory API)
 
